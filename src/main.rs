@@ -1,16 +1,23 @@
 use std::{
     fs::File,
-    io::{Read, Write, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     time::SystemTime,
 };
 
 use clap::{command, Parser, Subcommand};
-use color_eyre::{eyre::Context, Result};
-use flate2::{read::GzEncoder, Compression};
+use color_eyre::{
+    eyre::{self, Context},
+    Result,
+};
+use eyre::eyre;
+use flate2::{
+    read::{GzDecoder, GzEncoder},
+    Compression,
+};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use tar::Header;
+use tar::{Archive, Header};
 
 /// For each file, analysis of the file's entropy is computed, and a decision to either compress or not compress the file is made.
 enum EntropyAnalysis {
@@ -68,7 +75,7 @@ enum Commands {
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    
+
     let args = Cli::parse();
 
     match args.command {
@@ -88,7 +95,38 @@ fn main() -> Result<()> {
         Commands::Decompress {
             input_file,
             output_dir,
-        } => {}
+        } => {
+            decompress(&input_file, output_dir)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn decompress(input_file: &str, output_dir: Option<String>) -> Result<()> {
+    let output_dir = output_dir.unwrap_or_else(|| ".".to_string());
+
+    let mut archive = Archive::new(
+        File::open(&input_file).with_context(|| format!("Could not open {}", &input_file))?,
+    );
+
+    // Extract all of the files
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+
+        let path = entry.path()?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| eyre!("Could not get path in tar file"))?;
+
+        if path == TTARE_COMPRESS_FILE_NAME {
+            // Decompress the .tar.gz
+            let mut decompress = GzDecoder::new(entry);
+            let mut tar = Archive::new(&mut decompress);
+            tar.unpack(&output_dir)?;
+        } else {
+            entry.unpack_in(&output_dir)?;
+        }
     }
 
     Ok(())
@@ -110,7 +148,7 @@ fn compress(
         let analysis_result = analyze_entropy(&mut file, entropy_sampling, entropy_threshold)?;
 
         file.seek(SeekFrom::Start(0))?;
-        
+
         // Add the file to the correct tar
         match analysis_result {
             EntropyAnalysis::Compress => {
@@ -133,7 +171,7 @@ fn compress(
     // Create the header for the compressed tar
     let mut header = Header::new_gnu();
     header.set_size(compressed_buf.len() as u64);
-    header.set_mode(32 | 4 | 256);
+    header.set_mode(0o666);
     header.set_mtime(
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?
